@@ -6,7 +6,7 @@ The Extreme Drought in Grasslands Experiment (EDGE) imposed chronic drought for 
 
 | Site    | Code    | Grassland type | MAP[^1] (mm) | MAT[^2] (Celsius) | pH  |
 | ------------- |-------------|--------|--------|---------------|-----|
-| Cheyenne    | CHY | Mixed | 
+| High Plains Grassland Research Center | CHY | Mixed | 384 | 7.6 | 7.1 |
 | Central Plains Experimental Range | SGS   | Shortgrass | 342 | 8.6 | 6.2|
 | Hays Agricultural Research Center | HAYS | Mixed | 577 | 12.0 | 7.2 |
 | Konza Prairie Biological Station | KNZ | Tallgrass | 860 | 12.9 |6.4 |

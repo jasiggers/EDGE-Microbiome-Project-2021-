@@ -1,0 +1,1807 @@
+---
+title: "ITS Data Processing"
+author: "Alex Siggers"
+date: "2023-10-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Welcome! Today we will be learning how to analyze and visualize the raw data files produced in the bioinformatic pipeline USEARCH. 
+
+Hang on to this code! You can tweak it in order to analyze data from QIIME or other bioinformatics pipelines.
+
+# Getting started
+
+I find it's easiest to stay organized if you save this as a new R project. Save this file and your data files as a new R project so everything is together in the same folder/directory.
+
+Click the R icon in the top right corner and select **new project**
+
+Save your project somewhere you will remember it. Then save all of the practice data sheets from the email into the same folder.
+
+# Packages
+
+Here are the R packages we will be using today.
+
+If you are new to R you will need to install the packages first. Click the green arrow in this code chunk. If you already have these packages, you can skip this one.
+
+```{r}
+#install.package("tidyverse")
+#install.package("knitr")
+
+#install.packages("devtools")
+#devtools::install_github("leffj/mctoolsr")
+```
+
+Next we will need to load the packages we just installed, so they are active in this R session.
+
+```{r}
+library("tidyverse")
+library("mctoolsr")
+library("knitr")
+```
+
+
+# Loading in the Raw Data
+
+Today we will investigate some 16S amplicon sequencing data. The bulk of our data is in the **OTU Table.** The column headings are our sample names, and the rows contain OTUs (Operational Taxon Units - a close approximation of species for amplicon data) and read counts. The data table is a grid that contains the number of reads of each OTU in each sample. OTUs are numbered in order of abundance, with OTU_1 being the most abundant read in the library.
+
+The second file is the **taxonomy file.** This file contains the best guess of the phylogeny of every OTU in the sequencing run based on the SILVA database. There are no column headings in this file. Every row contains the OTU number, the taxonomies, and the taxonomies with a confidence score.
+
+The **OTU Table** and **taxonomy file** were produced using the USEARCH bioinformatic pipeline. I have loaded them into this R directory exactly as they were produced with no modifications.
+
+The third file is the **metadata file.** It contains information on all of the samples based on my experimental design. I made this one in excel and saved as a tab delimited txt file so it would be in the same format as the other two files.
+
+If you are using USEARCH, you will need to make your own metadata file, but the OTU table and Taxonomy file will come from USEARCH.
+
+##### All three data files are flat files delimited with tabs.
+
+The purpose of the experiment is to examine the bacterial microbiomes of corn and sugar beet plants in 10 different sites around this region of the United States. Every site had an irrigated treatment and a non-irrigated or drought treatment. We collected bulk soil, rhizosphere soil, roots, and leaves from every plant sampled. Together the aim is to determine how site, host species, and drought influence the bacterial microbiome in different plant compartments.
+
+**Let's load those files now**
+
+Make sure the files are in your current R directory. They should be in the same folder as your current R session.
+
+```{r}
+zotutab <- read_delim("C:\\Users\\jasig\\OneDrive - Colostate\\Documents\\My Projects\\EDGE LEgacy\\ITS\\ITS_feature_table_R.txt", delim="\t")
+meta <- read_delim("C:\\Users\\jasig\\OneDrive - Colostate\\Documents\\My Projects\\EDGE LEgacy\\Metadata.txt", delim = "\t")
+tax <- read_delim("C:\\Users\\jasig\\OneDrive - Colostate\\Documents\\My Projects\\EDGE LEgacy\\ITS\\ITS_taxonomy_R.txt", delim = "\t", col_names = FALSE)
+```
+
+Check to see if the files loaded. You should have 3 objects in your R environment called **zotutab**, **meta**, and **tax**.
+
+If you are having trouble, double check that the files are saved in your working directory, or write a file path. 
+
+*This is the hardest part so don't be stressed if it's not working!*
+
+# Cleaning the Data
+
+Now that we have our data loaded, we want to clean it and get it into a format that we can use for analysis.
+
+Our goal today is to get the data into a format compatible with the MCTools package. This has some built in analysis we can use.
+
+A similar package worth exploring is Phyloseq. 
+
+### Taxonomy file
+
+From this file, we only need the OTU IDs and the taxonomy information, so we can remove the rest.
+
+```{r}
+taxcut <- select(.data = tax, X1, X2)
+```
+
+Since the taxonomy file doesn't have column headings, we can add those now.
+
+```{r}
+taxcut <- taxcut %>%
+  dplyr::rename("#OTU ID" = "X1", "taxonomy" = "X2")
+taxcut <- taxcut[-1,]
+```
+
+Then we need to reformat the taxonomies themselves into the MCTools format. 
+
+```{r}
+taxcut$taxonomy <- str_replace_all(taxcut$taxonomy, ":", "__")
+taxcut$taxonomy <- str_replace_all(taxcut$taxonomy, ",", "; ")
+```
+
+That's all for the taxonomy file!
+
+### OTU Table
+
+The OTU table is going to take a lot more work. Depending on your analysis, you may need to eliminate irrelevant reads--in this case reads associated with the host DNA--and rare OTUs, which would mess up my analysis.
+
+Since this example data set contains plant microbiomes, we will need to do both.
+
+#### Remove Rare Taxa
+
+We'll start with the rare taxa because we will have to combine the taxonomy file and the OTU table in order to know what reads are host-associated.
+
+First we will make a new object that shows the total number of reads per OTU.
+
+If you are using your own data, you will need to adjust the dimensions at the end to include all of your OTU counts but not the OTU #s in the first row.
+
+```{r}
+otutotals <- mutate(.data = zotutab, otutotal = rowSums(zotutab[,2:311]))
+head(zotutab)
+head(otutotals)
+```
+
+For this example, let's filter out any OTU that has less than 30 total reads.
+
+*Note: This number will vary widely based on the experiment, especially the sample type.*
+
+Since we have soil, leaves, and roots all in this one library, our samples will be very diverse, so 30 is a reasonable number. We don't want to risk excluding OTUs that are abundant in leaves but not in soil for example.
+
+#Sticking with 30 for ITS processing due to prevalence of low read counts
+
+```{r}
+otunotrare <- otutotals %>%
+  filter(otutotal > 30)
+```
+
+#### Remove Host Reads
+
+Now we will add the taxonomy information to the OTU table so that we can remove the host-associated reads. 
+
+```{r}
+otutabtax <- inner_join(otunotrare, taxcut, by = "#OTU ID")
+```
+
+Because this is a 16S library containing leaf and root samples, we might have some Mitochondria and Chloroplasts from the host plant.
+
+Here we will create a new column in the OTU table, then populate it by telling what OTUs to remove and which to keep. Then we will remove all the unwanted reads.
+
+###Skipping for ITS processing###
+```{r}
+otutabtax$host <- 0
+
+otuhost <- otutabtax %>%
+  mutate(host = case_when(
+    grepl("Rickettsiales", taxonomy) ~ "remove",
+    grepl("Chloroplast", taxonomy) ~ "remove",
+    TRUE ~ "keep"))
+
+otufilt <- filter(.data = otuhost, host == "keep")
+```
+
+Just for fun, let's take a peak at how many of our reads in this sequencing run were from the microbiome (**keep**) and how many were from the host (**remove**).
+
+```{r}
+# relabel based on 
+otuhost <- otutabtax %>%
+  mutate(host = case_when(
+    grepl("Rickettsiales", taxonomy) ~ "host",
+    grepl("Chloroplast", taxonomy) ~ "host",
+    TRUE ~ "microbiome"))
+# make a new column with labels
+otuhost_2 <- otuhost %>%
+  mutate(read_type = case_when(
+    grepl("Rickettsiales", taxonomy) ~ "Mitochondria",
+    grepl("Chloroplast", taxonomy) ~ "Chloroplast",
+    TRUE ~ "Bacteria"))
+# log scale
+otuhost_3 <- otuhost_2 %>%
+  mutate(log_reads = log10(otutotal))
+# new plot
+otuhost_3 %>%
+ggplot(aes(x = read_type, y = log_reads)) + 
+  geom_jitter(size = .2, alpha = .3, aes(color = read_type)) + 
+  xlab("Source of Read") +   
+  geom_boxplot(alpha = .1) +
+  ylab("Log10 of Total Reads per OTU") + ggtitle("Host Associated vs. Microbiome Reads") + 
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 16),
+    text = element_text(size = 16),
+    legend.position = "right",
+    legend.key = element_rect(color = NULL, fill = "white"),
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(colour = "black"))
+```
+
+Whew! That's a lot of host reads! It's important to take them out so that they don't mess up our analysis. Notice that the most abundant OTU in our whole analysis is a mitochondria. 
+
+# Loading into MCToolsR
+
+Now that we have cleaned up our OTU table and added the taxonomy information in the right format, we can use the MCTools R package for some easy multivariate statistics and visualization. 
+
+The MCTools R reformatted data can also be manipulated further for more complex analysis. 
+
+One last cleaning step. Remove the columns we created in the OTU table.
+
+```{r}
+mcotu <- otutabtax %>%
+  select(-otutotal)
+```
+
+Next we need to write some new tab delim txts so we can upload them
+
+```{r}
+write_delim(mcotu, file = "mcotu.txt", delim = "\t")
+write_delim(meta, file = "meta.txt", delim = "\t")
+colnames(meta)[4] ="Treatment"
+```
+
+Then, all we have to do is read them into MCTools!
+
+```{r}
+input <- load_taxa_table("mcotu.txt", "meta.txt")
+```
+
+If that all went well, we should have a new object in our environment called **input**.
+
+This is the basic MCTools format. It is a **list** of three **dataframes**.
+
+The first is called *data_loaded* which is basically your OTU table. The next is *taxonomy_loaded* which is basically your taxonomy file, and the last is *map_loaded* which is basically your metadata file. 
+
+Seems redundant, but MCTools has some neat built in tools to look at all three dataframes at once.
+
+Let's get into it.
+
+# MCTools 
+
+## Subsetting Data
+
+Depending on your sequencing run, you will either subset your data first, or rarefy first. If you have some samples from someone else's experiment, or different tissue types that you will analyze separately, subset first. If you will be analyzing all of the samples in your sequencing run together, rarefy first.
+
+For this example, we will be subsetting first to remove our collaborator's samples and some bulk soil information, since we will be analyzing that separately. 
+
+## Skipping ##
+```{r}
+input <- filter_data(input, "species", filter_vals = NA)
+input <- filter_data(input, "niche", filter_vals = "bulk")
+```
+
+## Rarefying Data
+
+Next, we need to rarefy our data. Today we will be doing a single rarefication. The way this works is we pick a cutoff number. Any samples that have more reads than that cutoff number will be randomly cut down to that number of reads. For example, if a sample has 1000 reads and we rarefy to 500 reads, half the reads in that sample will be randomly selected and kept. Any sample that has fewer than our cutoff number will be removed from the analysis. So choose carefully!
+
+Let's first look at how many reads we have per sample. MCTools has a nice built in function for this:
+
+#Already rarefied in qiime2
+
+```{r}
+sort(colSums(input$data_loaded))
+```
+
+We have a big range here! Let's rarefy to 500 for this example. For your real data, you might want to reconsider how you are analyzing your data. For example, if you are analyzing your endosphere and rhizosphere data completely separately, you could subset those and rarefy to different cutoffs. 
+
+Here we will proceed with 500 because this is just an exercise. Then we will take a look at the column sums again:
+
+###Stuck with 9000 since all samples have over 9000 but many of the lower read counts hover b/w 9000-10000
+```{r}
+input_rar <- single_rarefy(input, 9000)
+sort(colSums(input_rar$data_loaded))
+```
+
+As you can see, every sample has 500 reads, and the ones that had fewer before were removed.
+
+###########################
+# Let's break into teams! #
+###########################
+
+Get together with your partner and come up with a research question you want to explore from this dataset. 
+
+We have:
+- 2 treatments (drought and irrigated)
+- 3 niche compartments (rhizosphere, roots, and leaves)
+- 2 species (corn and sugar beet)
+- 8 sites (CO1, CO3, CO8, CO10, NE4, NE7, MTA, MTB)
+
+Subset the data how you like, and then make some visualizations.
+
+For the example, I will look at how **site** influences the **rhizosphere** microbiome. If you are an R novice, feel free to keep it as it is! If you're an R expert, feel free to subset to whatever interests you most. 
+
+Good luck!
+
+### Subset the dataset based on what you are most interested in. 
+
+Refer to the mapping file to make sure you get the syntax right.
+
+```{r}
+input_rar$map_loaded
+```
+
+Then subset based on your interests. You can use filter_vals() to select what you want to remove or keep_vals() to select what you want to keep.
+
+In this example, I will create a new object called **sub** and keep only rhizosphere samples. You can adjust here based on your research question. 
+
+```{r}
+colnames(input_rar$map_loaded)[3] ="Treatment"
+colnames(input_rar$map_loaded)[6] ="Compartment"
+
+#Removing EXT Samples
+input_rar <- filter_data(input_rar, "Treatment", filter_vals = "EXT")
+
+#Reordering factor levels
+input_rar$map_loaded$Treatment <- factor(input_rar$map_loaded$Treatment , levels=c("CON", "CHR", "INT"))
+
+#Compartment subsetting
+bulk <- filter_data(input_rar, "Compartment", keep_vals = "BULK")
+rhizo <- filter_data(input_rar, "Compartment", keep_vals = "RHIZO")
+
+#Site subsetting
+knz <- filter_data(input_rar, "Site", keep_vals = "KNZ")
+sgs <- filter_data(input_rar, "Site", keep_vals = "SGS")
+hays <- filter_data(input_rar, "Site", keep_vals = "HAYS")
+chy <- filter_data(input_rar, "Site", keep_vals = "CHY")
+
+#Site & Compartment subsetting
+knz_rs <- filter_data(rhizo, "Site", keep_vals = "KNZ")
+sgs_rs <- filter_data(rhizo, "Site", keep_vals = "SGS")
+hays_rs <- filter_data(rhizo, "Site", keep_vals = "HAYS")
+chy_rs <- filter_data(rhizo, "Site", keep_vals = "CHY")
+
+knz_bulk <- filter_data(bulk, "Site", keep_vals = "KNZ")
+sgs_bulk <- filter_data(bulk, "Site", keep_vals = "SGS")
+hays_bulk <- filter_data(bulk, "Site", keep_vals = "HAYS")
+chy_bulk <- filter_data(bulk, "Site", keep_vals = "CHY")
+```
+
+Next let's look at some basic visualizations. 
+
+## Alpha Diversity
+
+You can use the **plot_diversity()** function to look at the alpha diversity.
+
+Swap out "site" based on your research question. For example, change it to "treatment" if you want to see how drought influences alpha diversity. You can also try different diversity metrics. The options are **richness**, **shannon**, and **simpson**.
+
+#Alpha diversity by compartment
+```{r}
+#By compartment
+plot_diversity(input_rar, "Compartment", metric="richness")
+plot_diversity(input_rar, "Compartment", metric="shannon")
+plot_diversity(input_rar, "Compartment", metric="simpson")
+
+#Bulk by site
+plot_diversity(bulk, "Site", metric = "shannon")
+plot_diversity(bulk, "Site", metric = "richness")
+plot_diversity(bulk, "Site", metric = "simpson")
+
+#Rhizo by site
+plot_diversity(rhizo, "Site", metric = "shannon")
+plot_diversity(rhizo, "Site", metric = "richness")
+plot_diversity(rhizo, "Site", metric = "simpson")
+
+#Bulk by treatment
+plot_diversity(bulk, "Treatment", metric = "simpson")
+plot_diversity(bulk, "Treatment", metric = "shannon")
+plot_diversity(bulk, "Treatment", metric = "richness")
+
+#Rhizo by treatment
+plot_diversity(bulk, "Treatment", metric = "simpson")
+plot_diversity(bulk, "Treatment", metric = "shannon")
+plot_diversity(bulk, "Treatment", metric = "richness")
+
+#All by species
+plot_diversity(input_rar, "Species", metric = "simpson")
+plot_diversity(input_rar, "Species", metric = "richness")
+
+#All by site
+plot_diversity(input_rar, "Site", metric = "simpson")
+
+#All by treatment
+plot_diversity(input_rar, "Treatment", metric = "richness")
+
+#All by SitexTrt
+plot_diversity(input_rar, "SiteTrt", metric = "simpson")
+
+#All by SitexTrtxComp
+plot_diversity(input_rar, "SiteTrtComp", metric = "richness")
+```
+
+# Alpha Diversity by Site
+
+# Konza Plotting
+```{r}
+#Bulk & Rhizosphere by Treatment
+plot_diversity(knz, "Treatment", metric="richness")
+plot_diversity(knz, "Treatment", metric="shannon")
+
+#Rhizosphere by Treatment
+plot_diversity(knz_rs, "Treatment", metric="richness")
+plot_diversity(knz_rs, "Treatment", metric="shannon")
+
+#Bulk by Treatment
+plot_diversity(knz_bulk, "Treatment", metric="richness")
+plot_diversity(knz_bulk, "Treatment", metric="shannon")
+```
+
+# Konza Shannon Diversity Models
+```{r}
+#Bulk & Rhizo by Trt
+# filtering to Konza
+knz_sub <- filter_data(input_rar, "Site", keep_vals = "KNZ")
+# calculate shannon index
+knz_shan <- vegan::diversity(t(knz_sub$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+knz_shan <- knz_shan[match(names(knz_shan), row.names(knz_sub$map_loaded))]
+knz_shan_df <- cbind(knz_sub$map_loaded, knz_shan)
+# GLM
+knz_shan_glm <- glm(knz_shan ~ Treatment, 
+                       data = knz_shan_df)
+knz_shan_anova <- car::Anova(knz_shan_glm, test.statistic = "F")
+
+#Bulk by Trt
+# filtering to Konza Bulk
+knz_sub_bulk <- filter_data(knz_sub, "Compartment", keep_vals = "BULK")
+# calculate shannon index
+knz_shan_bulk <- vegan::diversity(t(knz_sub_bulk$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+knz_shan_bulk <- knz_shan_bulk[match(names(knz_shan_bulk), row.names(knz_sub_bulk$map_loaded))]
+knz_shan_bulk_df <- cbind(knz_sub_bulk$map_loaded, knz_shan_bulk)
+# GLM
+knz_shan_bulk_glm <- glm(knz_shan_bulk ~ Treatment, 
+                       data = knz_shan_bulk_df)
+knz_shan_bulk_anova <- car::Anova(knz_shan_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+# filtering to Konza Rhizo
+knz_sub_rs <- filter_data(knz_sub, "Compartment", keep_vals = "RHIZO")
+# calculate shannon index
+knz_shan_rs <- vegan::diversity(t(knz_sub_rs$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+knz_shan_rs <- knz_shan_rs[match(names(knz_shan_rs), row.names(knz_sub_rs$map_loaded))]
+knz_shan_rs_df <- cbind(knz_sub_rs$map_loaded, knz_shan_rs)
+# GLM
+knz_shan_rs_glm <- glm(knz_shan_rs ~ Treatment, 
+                       data = knz_shan_rs_df)
+knz_shan_rs_anova <- car::Anova(knz_shan_rs_glm, test.statistic = "F")
+```
+
+# Konza Richness Models
+```{r}
+#Bulk & Rhizo by Trt
+#Konza richness
+head(knz_sub$data_loaded)
+knz_rich=vegan::specnumber(knz_sub$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+knz_rich <- knz_rich[match(names(knz_rich), row.names(knz_sub$map_loaded))]
+knz_rich_df <- cbind(knz_sub$map_loaded, knz_rich)
+# GLM
+knz_rich_glm <- glm(knz_rich ~ Treatment, 
+                       data = knz_rich_df)
+knz_rich_anova <- car::Anova(knz_rich_glm, test.statistic = "F")
+
+#Bulk by Trt
+#Konza richness
+head(knz_sub_bulk$data_loaded)
+knz_rich_bulk=vegan::specnumber(knz_sub_bulk$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+knz_rich_bulk <- knz_rich_bulk[match(names(knz_rich_bulk), row.names(knz_sub_bulk$map_loaded))]
+knz_rich_bulk_df <- cbind(knz_sub_bulk$map_loaded, knz_rich_bulk)
+# GLM
+knz_rich_bulk_glm <- glm(knz_rich_bulk ~ Treatment, 
+                       data = knz_rich_bulk_df)
+knz_rich_bulk_anova <- car::Anova(knz_rich_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+#Konza richness
+head(knz_sub_rs$data_loaded)
+knz_rich_rs=vegan::specnumber(knz_sub_rs$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+knz_rich_rs <- knz_rich_rs[match(names(knz_rich_rs), row.names(knz_sub_rs$map_loaded))]
+knz_rich_rs_df <- cbind(knz_sub_rs$map_loaded, knz_rich_rs)
+# GLM
+knz_rich_rs_glm <- glm(knz_rich_rs ~ Treatment, 
+                       data = knz_rich_rs_df)
+knz_rich_rs_anova <- car::Anova(knz_rich_rs_glm, test.statistic = "F")
+```
+
+# Testing Tukey HSD (not necessary due to no differences)
+```{r}
+library(agricolae)
+# Tukey HSD
+hsd_knz_treatment <- HSD.test(aov(knz_rich ~ Treatment, data = knz_rich_df), "Treatment", group = T)
+
+hsd_knz_treatment
+```
+
+# Hays
+```{r}
+plot_diversity(hays, "Treatment", metric="richness")
+plot_diversity(hays, "Treatment", metric="shannon")
+
+plot_diversity(hays_rs, "Treatment", metric="richness")
+plot_diversity(hays_rs, "Treatment", metric="shannon")
+
+plot_diversity(hays_bulk, "Treatment", metric="richness")
+plot_diversity(hays_bulk, "Treatment", metric="shannon")
+```
+
+# Hays Shannon Diversity Models
+```{r}
+#Bulk & Rhizo by Trt
+# filtering to Hays
+hays_sub <- filter_data(input_rar, "Site", keep_vals = "HAYS")
+# calculate shannon index
+hays_shan <- vegan::diversity(t(hays_sub$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+hays_shan <- hays_shan[match(names(hays_shan), row.names(hays_sub$map_loaded))]
+hays_shan_df <- cbind(hays_sub$map_loaded, hays_shan)
+# GLM
+hays_shan_glm <- glm(hays_shan ~ Treatment, 
+                       data = hays_shan_df)
+hays_shan_anova <- car::Anova(hays_shan_glm, test.statistic = "F")
+
+#Bulk by Trt
+# filtering to Hays Bulk
+hays_sub_bulk <- filter_data(hays_sub, "Compartment", keep_vals = "BULK")
+# calculate shannon index
+hays_shan_bulk <- vegan::diversity(t(hays_sub_bulk$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+hays_shan_bulk <- hays_shan_bulk[match(names(hays_shan_bulk), row.names(hays_sub_bulk$map_loaded))]
+hays_shan_bulk_df <- cbind(hays_sub_bulk$map_loaded, hays_shan_bulk)
+# GLM
+hays_shan_bulk_glm <- glm(hays_shan_bulk ~ Treatment, 
+                       data = hays_shan_bulk_df)
+hays_shan_bulk_anova <- car::Anova(hays_shan_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+# filtering to Hays Rhizo
+hays_sub_rs <- filter_data(hays_sub, "Compartment", keep_vals = "RHIZO")
+# calculate shannon index
+hays_shan_rs <- vegan::diversity(t(hays_sub_rs$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+hays_shan_rs <- hays_shan_rs[match(names(hays_shan_rs), row.names(hays_sub_rs$map_loaded))]
+hays_shan_rs_df <- cbind(hays_sub_rs$map_loaded, hays_shan_rs)
+# GLM
+hays_shan_rs_glm <- glm(hays_shan_rs ~ Treatment, 
+                       data = hays_shan_rs_df)
+hays_shan_rs_anova <- car::Anova(hays_shan_rs_glm, test.statistic = "F")
+```
+
+# Hays Richness Models
+```{r}
+#Bulk & Rhizo by Trt
+#Hays richness
+head(hays_sub$data_loaded)
+hays_rich=vegan::specnumber(hays_sub$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+hays_rich <- hays_rich[match(names(hays_rich), row.names(hays_sub$map_loaded))]
+hays_rich_df <- cbind(hays_sub$map_loaded, hays_rich)
+# GLM
+hays_rich_glm <- glm(hays_rich ~ Treatment, 
+                       data = hays_rich_df)
+hays_rich_anova <- car::Anova(hays_rich_glm, test.statistic = "F")
+
+#Bulk by Trt
+#Hays richness
+head(hays_sub_bulk$data_loaded)
+hays_rich_bulk=vegan::specnumber(hays_sub_bulk$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+hays_rich_bulk <- hays_rich_bulk[match(names(hays_rich_bulk), row.names(hays_sub_bulk$map_loaded))]
+hays_rich_bulk_df <- cbind(hays_sub_bulk$map_loaded, hays_rich_bulk)
+# GLM
+hays_rich_bulk_glm <- glm(hays_rich_bulk ~ Treatment, 
+                       data = hays_rich_bulk_df)
+hays_rich_bulk_anova <- car::Anova(hays_rich_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+#Hays richness
+head(hays_sub_rs$data_loaded)
+hays_rich_rs=vegan::specnumber(hays_sub_rs$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+hays_rich_rs <- hays_rich_rs[match(names(hays_rich_rs), row.names(hays_sub_rs$map_loaded))]
+hays_rich_rs_df <- cbind(hays_sub_rs$map_loaded, hays_rich_rs)
+# GLM
+hays_rich_rs_glm <- glm(hays_rich_rs ~ Treatment, 
+                       data = hays_rich_rs_df)
+hays_rich_rs_anova <- car::Anova(hays_rich_rs_glm, test.statistic = "F")
+```
+
+
+# Cheyenne
+```{r}
+plot_diversity(chy, "Treatment", metric="richness")
+plot_diversity(chy, "Treatment", metric="shannon")
+
+plot_diversity(chy_rs, "Treatment", metric="richness")
+plot_diversity(chy_rs, "Treatment", metric="shannon")
+
+plot_diversity(chy_rs, "Treatment", metric="richness")
+plot_diversity(chy_rs, "Treatment", metric="shannon")
+```
+
+# Cheyenne Shannon Diversity Models
+```{r}
+#Bulk & Rhizo by Trt
+# filtering to chy
+chy_sub <- filter_data(input_rar, "Site", keep_vals = "CHY")
+# calculate shannon index
+chy_shan <- vegan::diversity(t(chy_sub$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+chy_shan <- chy_shan[match(names(chy_shan), row.names(chy_sub$map_loaded))]
+chy_shan_df <- cbind(chy_sub$map_loaded, chy_shan)
+# GLM
+chy_shan_glm <- glm(chy_shan ~ Treatment, 
+                       data = chy_shan_df)
+chy_shan_anova <- car::Anova(chy_shan_glm, test.statistic = "F")
+
+#Bulk by Trt
+# filtering to chy Bulk
+chy_sub_bulk <- filter_data(chy_sub, "Compartment", keep_vals = "BULK")
+# calculate shannon index
+chy_shan_bulk <- vegan::diversity(t(chy_sub_bulk$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+chy_shan_bulk <- chy_shan_bulk[match(names(chy_shan_bulk), row.names(chy_sub_bulk$map_loaded))]
+chy_shan_bulk_df <- cbind(chy_sub_bulk$map_loaded, chy_shan_bulk)
+# GLM
+chy_shan_bulk_glm <- glm(chy_shan_bulk ~ Treatment, 
+                       data = chy_shan_bulk_df)
+chy_shan_bulk_anova <- car::Anova(chy_shan_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+# filtering to chy Rhizo
+chy_sub_rs <- filter_data(chy_sub, "Compartment", keep_vals = "RHIZO")
+# calculate shannon index
+chy_shan_rs <- vegan::diversity(t(chy_sub_rs$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+chy_shan_rs <- chy_shan_rs[match(names(chy_shan_rs), row.names(chy_sub_rs$map_loaded))]
+chy_shan_rs_df <- cbind(chy_sub_rs$map_loaded, chy_shan_rs)
+# GLM
+chy_shan_rs_glm <- glm(chy_shan_rs ~ Treatment, 
+                       data = chy_shan_rs_df)
+chy_shan_rs_anova <- car::Anova(chy_shan_rs_glm, test.statistic = "F")
+```
+
+# Cheyenne Richness Models
+```{r}
+#Bulk & Rhizo by Trt
+#Cheyenne richness
+head(chy_sub$data_loaded)
+chy_rich=vegan::specnumber(chy_sub$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+chy_rich <- chy_rich[match(names(chy_rich), row.names(chy_sub$map_loaded))]
+chy_rich_df <- cbind(chy_sub$map_loaded, chy_rich)
+# GLM
+chy_rich_glm <- glm(chy_rich ~ Treatment, 
+                       data = chy_rich_df)
+chy_rich_anova <- car::Anova(chy_rich_glm, test.statistic = "F")
+
+#Bulk by Trt
+#chy richness
+head(chy_sub_bulk$data_loaded)
+chy_rich_bulk=vegan::specnumber(chy_sub_bulk$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+chy_rich_bulk <- chy_rich_bulk[match(names(chy_rich_bulk), row.names(chy_sub_bulk$map_loaded))]
+chy_rich_bulk_df <- cbind(chy_sub_bulk$map_loaded, chy_rich_bulk)
+# GLM
+chy_rich_bulk_glm <- glm(chy_rich_bulk ~ Treatment, 
+                       data = chy_rich_bulk_df)
+chy_rich_bulk_anova <- car::Anova(chy_rich_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+#chy richness
+head(chy_sub_rs$data_loaded)
+chy_rich_rs=vegan::specnumber(chy_sub_rs$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+chy_rich_rs <- chy_rich_rs[match(names(chy_rich_rs), row.names(chy_sub_rs$map_loaded))]
+chy_rich_rs_df <- cbind(chy_sub_rs$map_loaded, chy_rich_rs)
+# GLM
+chy_rich_rs_glm <- glm(chy_rich_rs ~ Treatment, 
+                       data = chy_rich_rs_df)
+chy_rich_rs_anova <- car::Anova(chy_rich_rs_glm, test.statistic = "F")
+```
+
+
+# SGS
+```{r}
+plot_diversity(sgs, "Treatment", metric="richness")
+plot_diversity(sgs, "Treatment", metric="shannon")
+
+plot_diversity(sgs_rs, "Treatment", metric="richness")
+plot_diversity(sgs_rs, "Treatment", metric="shannon")
+
+plot_diversity(sgs_bulk, "Treatment", metric="richness")
+plot_diversity(sgs_bulk, "Treatment", metric="shannon")
+```
+
+# SGS Shannon Diversity Models
+```{r}
+#Bulk & Rhizo by Trt
+# filtering to sgs
+sgs_sub <- filter_data(input_rar, "Site", keep_vals = "SGS")
+# calculate shannon index
+sgs_shan <- vegan::diversity(t(sgs_sub$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+sgs_shan <- sgs_shan[match(names(sgs_shan), row.names(sgs_sub$map_loaded))]
+sgs_shan_df <- cbind(sgs_sub$map_loaded, sgs_shan)
+# GLM
+sgs_shan_glm <- glm(sgs_shan ~ Treatment, 
+                       data = sgs_shan_df)
+sgs_shan_anova <- car::Anova(sgs_shan_glm, test.statistic = "F")
+
+#Bulk by Trt
+# filtering to sgs Bulk
+sgs_sub_bulk <- filter_data(sgs_sub, "Compartment", keep_vals = "BULK")
+# calculate shannon index
+sgs_shan_bulk <- vegan::diversity(t(sgs_sub_bulk$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+sgs_shan_bulk <- sgs_shan_bulk[match(names(sgs_shan_bulk), row.names(sgs_sub_bulk$map_loaded))]
+sgs_shan_bulk_df <- cbind(sgs_sub_bulk$map_loaded, sgs_shan_bulk)
+# GLM
+sgs_shan_bulk_glm <- glm(sgs_shan_bulk ~ Treatment, 
+                       data = sgs_shan_bulk_df)
+sgs_shan_bulk_anova <- car::Anova(sgs_shan_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+# filtering to sgs Rhizo
+sgs_sub_rs <- filter_data(sgs_sub, "Compartment", keep_vals = "RHIZO")
+# calculate shannon index
+sgs_shan_rs <- vegan::diversity(t(sgs_sub_rs$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+sgs_shan_rs <- sgs_shan_rs[match(names(sgs_shan_rs), row.names(sgs_sub_rs$map_loaded))]
+sgs_shan_rs_df <- cbind(sgs_sub_rs$map_loaded, sgs_shan_rs)
+# GLM
+sgs_shan_rs_glm <- glm(sgs_shan_rs ~ Treatment, 
+                       data = sgs_shan_rs_df)
+sgs_shan_rs_anova <- car::Anova(sgs_shan_rs_glm, test.statistic = "F")
+```
+
+# SGS Richness Models
+```{r}
+#Bulk & Rhizo by Trt
+#SGS richness
+head(sgs_sub$data_loaded)
+sgs_rich=vegan::specnumber(sgs_sub$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+sgs_rich <- sgs_rich[match(names(sgs_rich), row.names(sgs_sub$map_loaded))]
+sgs_rich_df <- cbind(sgs_sub$map_loaded, sgs_rich)
+# GLM
+sgs_rich_glm <- glm(sgs_rich ~ Treatment, 
+                       data = sgs_rich_df)
+sgs_rich_anova <- car::Anova(sgs_rich_glm, test.statistic = "F")
+
+#Bulk by Trt
+#sgs richness
+head(sgs_sub_bulk$data_loaded)
+sgs_rich_bulk=vegan::specnumber(sgs_sub_bulk$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+sgs_rich_bulk <- sgs_rich_bulk[match(names(sgs_rich_bulk), row.names(sgs_sub_bulk$map_loaded))]
+sgs_rich_bulk_df <- cbind(sgs_sub_bulk$map_loaded, sgs_rich_bulk)
+# GLM
+sgs_rich_bulk_glm <- glm(sgs_rich_bulk ~ Treatment, 
+                       data = sgs_rich_bulk_df)
+sgs_rich_bulk_anova <- car::Anova(sgs_rich_bulk_glm, test.statistic = "F")
+
+#Rhizo by Trt
+#sgs richness
+head(sgs_sub_rs$data_loaded)
+sgs_rich_rs=vegan::specnumber(sgs_sub_rs$data_loaded,MARGIN=2)
+# make data frame with metadata and shannon index
+sgs_rich_rs <- sgs_rich_rs[match(names(sgs_rich_rs), row.names(sgs_sub_rs$map_loaded))]
+sgs_rich_rs_df <- cbind(sgs_sub_rs$map_loaded, sgs_rich_rs)
+# GLM
+sgs_rich_rs_glm <- glm(sgs_rich_rs ~ Treatment, 
+                       data = sgs_rich_rs_df)
+sgs_rich_rs_anova <- car::Anova(sgs_rich_rs_glm, test.statistic = "F")
+```
+
+
+## Beta Diversity
+
+Let's see how different the microbiomes are based on our research question. First we will need to calculate a dissimilarity matrix. MCTools defaults to Bray-Curtis. 
+
+Then we will calculate our ordination. There are a few different options. Here, I've set it to **'nmds'** but you can also choose **'pcoa'** or **'constrained'**. Feel free to check them all out!
+
+Then, using our dissimilarity matrix and ordination, we can make our plot. I listed **'site'** first, then added **'treatment'** because I was curious to see how treatment would influence the rhizosphere microbiomes. 
+
+```{r}
+dm <- calc_dm(input_rar$data_loaded)
+ord <- calc_ordination(dm, 'pcoa')
+ordnmds <- calc_ordination(dm, 'nmds')
+plot_ordination(input_rar, ord, 'Site', 'Treatment', hulls = TRUE)
+
+plot_ordination(input_rar, ord, 'Site', hulls = TRUE)
+
+plot_ordination(input_rar, ord, 'Species', hulls = TRUE)
+
+plot_ordination(input_rar, ord, 'SiteTrt', hulls = TRUE)
+
+plot_ordination(input_rar, ord, 'SiteTrtComp', hulls = TRUE)
+```
+
+# Beta Diversity by Site
+
+# Konza
+```{r}
+#Bulk & Rhizosphere
+konzdm <- calc_dm(knz$data_loaded)
+konzpcoa <- calc_ordination(konzdm, 'pcoa')
+konznmds <- calc_ordination(konzdm, 'nmds')
+plot_ordination(knz, konzpcoa, 'Treatment', hulls = TRUE)
+plot_ordination(knz, konznmds, 'Treatment', hulls = TRUE)
+plot_ordination(knz, konznmds, 'Species', hulls = TRUE)
+
+#Rhizosphere
+konz_rsdm <- calc_dm(knz_rs$data_loaded)
+konz_rspcoa <- calc_ordination(konz_rsdm, 'pcoa')
+konz_rsnmds <- calc_ordination(konz_rsdm, 'nmds')
+plot_ordination(knz_rs, konz_rspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(knz_rs, konz_rsnmds, 'Treatment', hulls = TRUE)
+plot_ordination(knz_rs, konz_rsnmds, 'Species', hulls = TRUE)
+
+#Bulk
+konz_bulkdm <- calc_dm(knz_bulk$data_loaded)
+konz_bulkpcoa <- calc_ordination(konz_bulkdm, 'pcoa')
+konz_bulknmds <- calc_ordination(konz_bulkdm, 'nmds')
+plot_ordination(knz_bulk, konz_bulkpcoa, 'Treatment', hulls = TRUE)
+plot_ordination(knz_bulk, konz_bulknmds, 'Treatment', hulls = TRUE)
+plot_ordination(knz_bulk, konz_bulknmds, 'Species', hulls = TRUE)
+```
+
+# Hays
+```{r}
+#Bulk and Rhizosphere
+haysdm <- calc_dm(hays$data_loaded)
+hayspcoa <- calc_ordination(haysdm, 'pcoa')
+haysnmds <- calc_ordination(haysdm, 'nmds')
+plot_ordination(hays, hayspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(hays, haysnmds, 'Treatment', hulls = TRUE)
+plot_ordination(hays, haysnmds, 'Species', hulls = TRUE)
+
+#Rhizosphere
+hays_rsdm <- calc_dm(hays_rs$data_loaded)
+hays_rspcoa <- calc_ordination(hays_rsdm, 'pcoa')
+hays_rsnmds <- calc_ordination(hays_rsdm, 'nmds')
+plot_ordination(hays_rs, hays_rspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(hays_rs, hays_rsnmds, 'Treatment', hulls = TRUE)
+plot_ordination(hays_rs, hays_rsnmds, 'Species', hulls = TRUE)
+
+#Bulk
+hays_bulkdm <- calc_dm(hays_bulk$data_loaded)
+hays_bulkpcoa <- calc_ordination(hays_bulkdm, 'pcoa')
+hays_bulknmds <- calc_ordination(hays_bulkdm, 'nmds')
+plot_ordination(hays_bulk, hays_bulkpcoa, 'Treatment', hulls = TRUE)
+plot_ordination(hays_bulk, hays_bulknmds, 'Treatment', hulls = TRUE)
+plot_ordination(hays_bulk, hays_bulknmds, 'Species', hulls = TRUE)
+```
+
+# CHY
+```{r}
+#Bulk and Rhizosphere
+chydm <- calc_dm(chy$data_loaded)
+chypcoa <- calc_ordination(chydm, 'pcoa')
+chynmds <- calc_ordination(chydm, 'nmds')
+plot_ordination(chy, chypcoa, 'Treatment', hulls = TRUE)
+plot_ordination(chy, chynmds, 'Treatment', hulls = TRUE)
+plot_ordination(chy, chynmds, 'Species', hulls = TRUE)
+plot_ordination(chy, chynmds, 'Compartment', hulls = TRUE)
+plot_ordination(chy, chynmds, 'Sample', hulls = TRUE)
+
+
+#Rhizosphere
+chy_rsdm <- calc_dm(chy_rs$data_loaded)
+chy_rspcoa <- calc_ordination(chy_rsdm, 'pcoa')
+chy_rsnmds <- calc_ordination(chy_rsdm, 'nmds')
+plot_ordination(chy_rs, chy_rspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(chy_rs, chy_rsnmds, 'Treatment', hulls = TRUE)
+plot_ordination(chy_rs, chy_rsnmds, 'Species', hulls = TRUE)
+
+#Bulk
+chy_bulkdm <- calc_dm(chy_bulk$data_loaded)
+chy_bulkpcoa <- calc_ordination(chy_bulkdm, 'pcoa')
+chy_bulknmds <- calc_ordination(chy_bulkdm, 'nmds')
+plot_ordination(chy_bulk, chy_bulkpcoa, 'Treatment', hulls = TRUE)
+plot_ordination(chy_bulk, chy_bulknmds, 'Treatment', hulls = TRUE)
+plot_ordination(chy_bulk, chy_bulknmds, 'Species', hulls = TRUE)
+```
+
+# SGS
+```{r}
+#Bulk and Rhizosphere
+sgsdm <- calc_dm(sgs$data_loaded)
+sgspcoa <- calc_ordination(sgsdm, 'pcoa')
+sgsnmds <- calc_ordination(sgsdm, 'nmds')
+plot_ordination(sgs, sgspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(sgs, sgsnmds, 'Treatment', hulls = TRUE)
+plot_ordination(sgs, sgsnmds, 'Species', hulls = TRUE)
+
+#Rhizosphere
+sgs_rsdm <- calc_dm(sgs_rs$data_loaded)
+sgs_rspcoa <- calc_ordination(sgs_rsdm, 'pcoa')
+sgs_rsnmds <- calc_ordination(sgs_rsdm, 'nmds')
+plot_ordination(sgs_rs, sgs_rspcoa, 'Treatment', hulls = TRUE)
+plot_ordination(sgs_rs, sgs_rsnmds, 'Treatment', hulls = TRUE)
+plot_ordination(sgs_rs, sgs_rsnmds, 'Species', hulls = TRUE)
+
+#Bulk
+sgs_bulkdm <- calc_dm(sgs_bulk$data_loaded)
+sgs_bulkpcoa <- calc_ordination(sgs_bulkdm, 'pcoa')
+sgs_bulknmds <- calc_ordination(sgs_bulkdm, 'nmds')
+plot_ordination(sgs_bulk, sgs_bulkpcoa, 'Treatment', hulls = TRUE)
+plot_ordination(sgs_bulk, sgs_bulknmds, 'Treatment', hulls = TRUE)
+plot_ordination(sgs_bulk, sgs_bulknmds, 'Species', hulls = TRUE)
+```
+
+
+
+Next let's look and see if some taxa are more influenced by our variable of interest than others. We can do this with the heatmap function.
+
+Try changing the level number for a broader or narrower look. 
+1 = kingdom
+2 = phylum
+3 = class
+4 = order
+5 = family
+6 = genus
+7 = species
+
+```{r}
+tax_sum <- summarize_taxonomy(input_rar, level = 2, report_higher_tax = FALSE)
+plot_ts_heatmap(tax_sum, input_rar$map_loaded, 0.01, 'Species')
+```
+
+These are the main functions in MCTools, but there is more you can do! 
+
+Check out this link for a full list of MCTools functions:
+
+https://github.com/leffj/mctoolsr/blob/master/function_list.md
+
+Try out a few. For example, can you figure out some core taxa for your question? For help, type core_taxa in the help section. Then try writing some code below. Try some other codes!
+
+```{r}
+core_taxa(input_rar, "Treatment")
+```
+
+Well done everyone! Thanks for following along! I'll add some bonus code at the bottom for somer other analyses I frequently run. Happy coding!
+
+###############################################################################
+
+# Other Analyses
+
+In the rest of the file I've added some examples of other analyses I frequently run to explore amplicon data. They are a bit more complicated but feel free to save them as a reference when you are analyzing your data in the future.
+
+## Shannon Diversity (boxplot, GLM, and Tukey HSD Test)
+
+Here is how to run a general linear model and an anova on that model for alpha-diversity. In this example we will run a fully crossed model that tests all of our variables and their relationship with shannon diversity.
+
+```{r}
+library(car)
+# subsetting (in this example, rhizosphere soil only)
+sub <- filter_data(input_rar, "niche", keep_vals = "rhizo")
+# if you don't want subsetting but don't want to change the syntax:
+sub <- input_rar
+# calculate shannon index
+shan <- vegan::diversity(t(input_rar$data_loaded), index = "shannon")
+# make data frame with metadata and shannon index
+shan <- shan[match(names(shan), row.names(sub$map_loaded))]
+shan_df <- cbind(sub$map_loaded, shan)
+# GLM
+shan_glm <- glm(shan ~ site + treatment + species + niche
+                       + site:treatment + site:species + site:niche
+                       + treatment:species + treatment:niche + species:niche 
+                       + site:treatment:species + site:treatment:niche 
+                       + site:species:niche
+                       + treatment:species:niche + site:treatment:species:niche, 
+                       data = shan_df)
+shan_anova <- car::Anova(shan_glm, test.statistic = "F") 
+## If it's masked, specify car package
+# output as a dataframe
+library(broom)
+shan_tidy <- tidy(shan_anova)
+shan_tidy
+```
+
+Here is how to run a Tukey HSD test in order to determine which treatments have significantly different alpha diversities. In this example we will test **treatment** and **niche**. 
+
+```{r}
+library(agricolae)
+# Tukey HSD
+hsd_knz_treatment <- HSD.test(aov(knz_rich ~ Treatment, data = knz_rich_df), "Treatment", group = T)
+
+hsd_knz_treatment
+```
+
+Here is how to make a plot of the data. Let's do a plot of treatments side by side in each niche compartment
+
+```{r}
+library(ggplot2)
+# reorder
+class(shan_df$niche)
+shan_df$niche <- as_factor(shan_df$niche)
+levels(shan_df$niche)
+reorder(shan_df$niche, shan, desc = FALSE)
+# Boxplot
+ggplot(shan_df, aes(x = niche, fill = treatment, y = shan)) + 
+  geom_boxplot() + geom_jitter(size = 1) + 
+  xlab("Plant Niche") + ylab("Shannon Diversity") + 
+  ggtitle("16S") +  
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 16),
+    text = element_text(size = 16),
+    legend.position = "left",
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(colour = "black"))
+```
+
+## PERMANOVA
+
+When showing a visual orientation, it is important to include the PERMANOVA results along with the figure.
+
+*this is a full model so it will take a long time to run and might crash your computer*
+
+```{r}
+library(vegan)
+# you can filter your data here
+ITSperm <- input_rar 
+# build data table to perform PERMANOVA on
+x <- cbind(ITSperm$map_loaded, t(ITSperm$data_loaded))
+#head(x)
+# create and run PERMANOVA model
+## **this is a full model. It might crash your computer so be careful**
+permanovaITS <- adonis2(x[,15:ncol(x)] ~ Site + Treatment + Species + Compartment
+                       + Site:Treatment + Site:Species + Site:Compartment
+                       + Treatment:Species + Treatment:Compartment + Species:Compartment 
+                       + Site:Treatment:Species + Site:Treatment:Compartment 
+                       + Site:Species:Compartment
+                       + Treatment:Species:Treatment + Site:Treatment:Species:Compartment,
+                       data = x)
+# view PERMANOVA object
+permanovaITS
+perm_df <- tidy(permanova16S)
+perm_df
+```
+
+# Attempting a cleaner run with simple Permanova models
+```{r}
+library(vegan)
+library(tidyverse)
+library(broom)
+
+ITSperm <- input_rar 
+# build data table to perform PERMANOVA on
+x <- cbind(ITSperm$map_loaded, t(ITSperm$data_loaded))
+head(x)
+permanovaITS <- adonis2(x[,16:ncol(x)] ~ Site, data=x)
+
+# view PERMANOVA object
+permanovaITS
+perm_df <- tidy(permanovaITS)
+perm_df
+
+```
+
+# Konza permanovas
+```{r}
+ITSknz <- knz
+knzx <- cbind(ITSknz$map_loaded, t(ITSknz$data_loaded))
+head(knzx)
+
+#All by treatment
+permanovaKNZ_trt <- adonis2(knzx[,15:ncol(knzx)] ~ Treatment, data=knzx, method="bray")
+permanovaKNZ_trt
+
+perm_knz_trt_df = tidy(permanovaKNZ_trt)
+perm_knz_trt_df
+
+#All by species
+permanovaKNZ_spec <- adonis2(knzx[,15:ncol(knzx)] ~ Species, data=knzx, method="bray")
+permanovaKNZ_spec
+
+perm_knz_spec_df = tidy(permanovaKNZ_spec)
+perm_knz_spec_df
+
+#All by treatment x species
+permanovaKNZ_trt_spec <- adonis2(knzx[,15:ncol(knzx)] ~ Treatment*Species, data=knzx, method="bray")
+permanovaKNZ_trt_spec
+
+#Rhizosphere by treatment
+ITSknz_rs <- knz_rs
+knzx_rs <- cbind(ITSknz_rs$map_loaded, t(ITSknz_rs$data_loaded))
+head(knzx_rs)
+permanovaKNZ_rstrt <- adonis2(knzx_rs[,15:ncol(knzx_rs)] ~ Treatment, data=knzx_rs, method="bray")
+permanovaKNZ_rstrt
+
+perm_knz_rstrt_df = tidy(permanovaKNZ_rstrt)
+perm_knz_rstrt_df
+
+#Rhizosphere by species
+permanovaKNZ_rsspec <- adonis2(knzx_rs[,15:ncol(knzx_rs)] ~ Species, data=knzx_rs, method="bray")
+permanovaKNZ_rsspec
+
+#Rhizosphere by treatment x species
+permanovaKNZ_rstrt_spec <- adonis2(knzx_rs[,15:ncol(knzx_rs)] ~ Treatment*Species, data=knzx_rs, method="bray")
+permanovaKNZ_trt_spec
+
+#Bulk by treatment
+ITSknz_bulk <- knz_bulk
+knzx_bulk <- cbind(ITSknz_bulk$map_loaded, t(ITSknz_bulk$data_loaded))
+head(knzx_bulk)
+permanovaKNZ_bulktrt <- adonis2(knzx_bulk[,15:ncol(knzx_bulk)] ~ Treatment, data=knzx_bulk, method="bray")
+permanovaKNZ_bulktrt
+
+perm_knz_bulktrt_df = tidy(permanovaKNZ_bulktrt)
+perm_knz_bulktrt_df
+```
+
+# Hays Permanovas
+```{r}
+ITShays <- hays
+haysx <- cbind(ITShays$map_loaded, t(ITShays$data_loaded))
+head(haysx)
+
+#All by treatment
+permanovahays_trt <- adonis2(haysx[,15:ncol(haysx)] ~ Treatment, data=haysx, method="bray")
+permanovahays_trt
+
+perm_hays_trt_df = tidy(permanovahays_trt)
+perm_hays_trt_df
+
+#All by species
+permanovahays_spec <- adonis2(haysx[,15:ncol(haysx)] ~ Species, data=haysx, method="bray")
+permanovahays_spec
+
+perm_hays_spec_df = tidy(permanovahays_spec)
+perm_hays_spec_df
+
+#All by treatment x species
+permanovahays_trt_spec <- adonis2(haysx[,15:ncol(haysx)] ~ Treatment*Species, data=haysx, method="bray")
+permanovahays_trt_spec
+
+#Rhizosphere by treatment
+ITShays_rs <- hays_rs
+haysx_rs <- cbind(ITShays_rs$map_loaded, t(ITShays_rs$data_loaded))
+head(haysx_rs)
+permanovahays_rstrt <- adonis2(haysx_rs[,15:ncol(haysx_rs)] ~ Treatment, data=haysx_rs, method="bray")
+permanovahays_rstrt
+
+perm_hays_rstrt_df = tidy(permanovahays_rstrt)
+perm_hays_rstrt_df
+
+#Rhizosphere by species
+permanovahays_rsspec <- adonis2(haysx_rs[,15:ncol(haysx_rs)] ~ Species, data=haysx_rs, method="bray")
+permanovahays_rsspec
+
+#Rhizosphere by treatment x species
+permanovahays_rstrt_spec <- adonis2(haysx_rs[,15:ncol(haysx_rs)] ~ Treatment*Species, data=haysx_rs, method="bray")
+permanovahays_trt_spec
+
+#Bulk by treatment
+ITShays_bulk <- hays_bulk
+haysx_bulk <- cbind(ITShays_bulk$map_loaded, t(ITShays_bulk$data_loaded))
+head(haysx_bulk)
+permanovahays_bulktrt <- adonis2(haysx_bulk[,15:ncol(haysx_bulk)] ~ Treatment, data=haysx_bulk, method="bray")
+permanovahays_bulktrt
+
+perm_hays_bulktrt_df = tidy(permanovahays_bulktrt)
+perm_hays_bulktrt_df
+```
+
+# Cheyenne Permanovas
+```{r}
+ITSchy <- chy
+chyx <- cbind(ITSchy$map_loaded, t(ITSchy$data_loaded))
+head(chyx)
+
+#All by treatment
+permanovachy_trt <- adonis2(chyx[,15:ncol(chyx)] ~ Treatment, data=chyx, method="bray")
+permanovachy_trt
+
+perm_chy_trt_df = tidy(permanovachy_trt)
+perm_chy_trt_df
+
+
+#Rhizosphere by treatment
+ITSchy_rs <- chy_rs
+chyx_rs <- cbind(ITSchy_rs$map_loaded, t(ITSchy_rs$data_loaded))
+head(chyx_rs)
+permanovachy_rstrt <- adonis2(chyx_rs[,15:ncol(chyx_rs)] ~ Treatment, data=chyx_rs, method="bray")
+permanovachy_rstrt
+
+perm_chy_rstrt_df = tidy(permanovachy_rstrt)
+perm_chy_rstrt_df
+
+#Bulk by treatment
+ITSchy_bulk <- chy_bulk
+chyx_bulk <- cbind(ITSchy_bulk$map_loaded, t(ITSchy_bulk$data_loaded))
+head(chyx_bulk)
+permanovachy_bulktrt <- adonis2(chyx_bulk[,15:ncol(chyx_bulk)] ~ Treatment, data=chyx_bulk, method="bray")
+permanovachy_bulktrt
+
+perm_chy_bulktrt_df = tidy(permanovachy_bulktrt)
+perm_chy_bulktrt_df
+```
+
+# SGS Permanovas
+```{r}
+ITSsgs <- sgs
+sgsx <- cbind(ITSsgs$map_loaded, t(ITSsgs$data_loaded))
+head(sgsx)
+permanovaSGS_trt <- adonis2(sgsx[,15:ncol(sgsx)] ~ Treatment, data=sgsx, distance="bray")
+permanovaSGS_trt
+
+permanovaSGS_spec <- adonis2(sgsx[,15:ncol(sgsx)] ~ Species, data=sgsx)
+permanovaSGS_spec
+
+#Rhizosphere
+ITSsgs_rs <- sgs_rs
+sgsx_rs <- cbind(ITSsgs_rs$map_loaded, t(ITSsgs_rs$data_loaded))
+head(sgsx_rs)
+permanovasgs_rstrt <- adonis2(sgsx_rs[,15:ncol(sgsx_rs)] ~ Treatment, data=sgsx_rs, method="bray")
+permanovasgs_rstrt
+
+perm_sgs_rstrt_df = tidy(permanovasgs_rstrt)
+perm_sgs_rstrt_df
+
+#Bulk
+ITSsgs_bulk <- sgs_bulk
+sgsx_bulk <- cbind(ITSsgs_bulk$map_loaded, t(ITSsgs_bulk$data_loaded))
+head(sgsx_bulk)
+permanovasgs_bulktrt <- adonis2(sgsx_bulk[,15:ncol(sgsx_bulk)] ~ Treatment, data=sgsx_bulk, method="bray")
+permanovasgs_bulktrt
+
+perm_sgs_bulktrt_df = tidy(permanovasgs_bulktrt)
+perm_sgs_bulktrt_df
+```
+
+## Pairwise Adonis
+#SGS RS
+```{r}
+library(devtools)
+library(pairwiseAdonis)
+
+#By treatment
+otuTAB<-sgs_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-sgs_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Treatment)
+pair.mod
+
+#By species
+otuTAB<-sgs_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-sgs_rs$map_loaded
+mta$Species <- as.factor (mta$Species)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Species)
+pair.mod
+```
+
+#KNZ RS
+```{r}
+#By treatment
+otuTAB<-knz_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-knz_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Treatment)
+pair.mod
+
+#By species
+otuTAB<-knz_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-knz_rs$map_loaded
+mta$Species <- as.factor (mta$Species)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Species)
+pair.mod
+```
+
+#HAYS RS
+```{r}
+#By treatment
+otuTAB<-hays_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-hays_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Treatment)
+pair.mod
+
+#By species
+otuTAB<-hays_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-hays_rs$map_loaded
+mta$Species <- as.factor (mta$Species)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Species)
+pair.mod
+```
+
+#CHY RS
+```{r}
+otuTAB<-chy_rs$data_loaded
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-chy_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+pair.mod<-pairwise.adonis(t(otuTAB),factors=mta$Treatment)
+pair.mod
+```
+
+
+## CAPS
+
+A CAPs is a constrained ordination that focuses on one variable. It works great if you are trying visualize differences based on one variable (for example, niche compartment). 
+#(Didn't work)
+```{r}
+library(BiodiversityR)
+# subset data to your liking using the mctools functions
+KNZ16Ssub = filter_data(input_rar, 'Site', filter_vals = c('CHY','HAYS','SGS')) 
+# Subsets Konza samples
+# reformat and save the files as new objects
+KNZ_otuTAB <- (KNZ16Ssub$data_loaded)
+KNZ_mta <- KNZ16Ssub$map_loaded
+# clean data
+sapply (KNZ_mta, class) 
+# check class. All categorical variables should be factors
+# Make categorical variables factors. My variables are Site, Treatment, Species, and Sample. 
+ls(KNZ_mta)
+KNZ_mta$Treatment <- factor(KNZ_mta$Treatment, ordered=FALSE)
+KNZ_mta$Site <- as.factor (KNZ_mta$Site)
+KNZ_mta$Species <- as.factor (KNZ_mta$Species)
+KNZ_mta$Sample <- as.factor (KNZ_mta$Sample)
+# calculate CAPs distances
+o.dist <- vegdist (KNZ_otuTAB, method="bray", binary=FALSE)
+# constrain distance to variable of interest. Here I am interested in niche.
+# Make ordination model in biodiversityR
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = KNZ_mta,
+                                 dist = "bray", axes = 2, m = 0, add = FALSE, permutations = 500)
+# view model. I've # it out because the output is very long
+Ordination.model1 
+```
+
+# Attempting another site with CAPS
+```{r}
+library(BiodiversityR)
+# subset data to your liking using the mctools functions
+sgs16Ssub = filter_data(input_rar, 'Site', filter_vals = c('CHY','HAYS','KNZ')) 
+# Subsets Konza samples
+# reformat and save the files as new objects
+sgs_otuTAB <- (sgs16Ssub$data_loaded)
+sgs_mta <- sgs16Ssub$map_loaded
+# clean data
+sapply (sgs_mta, class) 
+# check class. All categorical variables should be factors
+# Make categorical variables factors. My variables are Site, Treatment, Species, and Sample. 
+ls(sgs_mta)
+sgs_mta$Treatment <- factor(sgs_mta$Treatment, ordered=FALSE)
+sgs_mta$Site <- as.factor (sgs_mta$Site)
+sgs_mta$Species <- as.factor (sgs_mta$Species)
+sgs_mta$Sample <- as.factor (sgs_mta$Sample)
+# calculate CAPs distances
+o.dist <- vegdist (sgs_otuTAB, method="bray", binary=FALSE)
+# constrain distance to variable of interest. Here I am interested in niche.
+# Make ordination model in biodiversityR
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = sgs_mta,
+                                 dist = "bray", axes = 2, m = 0, add = FALSE, permutations = 500)
+# view model. I've # it out because the output is very long
+Ordination.model1 
+```
+(Didn't work)
+#Attempting CAPS with Leena's code
+#SGS RS
+```{r}
+library(dplyr)
+library(BiodiversityR)
+library (vegan)
+library (MASS)
+
+otuTAB<-sgs_rs$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-sgs_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#SGS Bulk
+```{r}
+otuTAB<-sgs_bulk$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-sgs_bulk$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#SGS Bulk & RS
+```{r}
+otuTAB<-sgs$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-sgs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Konza RS
+```{r}
+otuTAB<-knz_rs$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-knz_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Konza Bulk
+```{r}
+otuTAB<-knz_bulk$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-knz_bulk$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Konza Bulk & RS
+```{r}
+otuTAB<-knz$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-knz$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Hays RS
+```{r}
+otuTAB<-hays_rs$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-hays_rs$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Hays Bulk
+```{r}
+otuTAB<-hays_bulk$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-hays_bulk$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Hays Bulk & RS
+```{r}
+otuTAB<-hays$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-hays$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Cheyenne RS
+```{r}
+otuTAB<-chy_rs$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-chy_rs$map_loaded
+
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Cheyenne Bulk
+```{r}
+otuTAB<-chy_bulk$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-chy_bulk$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+#Cheyenne Bulk & RS
+```{r}
+otuTAB<-chy$data_loaded
+
+otuTAB <- as.data.frame (otuTAB)
+otuTABtranspose<-t(otuTAB)
+mta<-chy$map_loaded
+mta$Treatment <- as.factor (mta$Treatment)
+
+o.dist <-vegdist (otuTABtranspose)
+Ordination.model1 <- CAPdiscrim (o.dist ~ Treatment, data = mta,
+                                 dist="bray", axes=2, m=0, add=FALSE)
+
+
+plot1<-ordiplot(Ordination.model1,type="none")
+plot1
+ordisymbol(plot1, mta, "Treatment", legend=TRUE,legend.x="topleft")
+ordiellipse(Ordination.model1, groups = mta$Treatment, draw = "polygon",col=c("blue","orange","gray"))
+```
+
+
+Once you've done the calculations in BiodiversityR, you can plot directly in BiodiversityR or you can extract the point locations and plot them in ggplot.
+
+Here's the plot in BiodiversityR. You have to run the whole chunk when working in R Markdown
+
+```{r}
+# Make baseline CAPs figure in biodiversityR
+plot1 <- ordiplot(Ordination.model1, type = "none")
+ordisymbol(plot1, mta, "niche", col = FALSE, legend = TRUE, legend.x = "bottomright")
+ordiellipse(Ordination.model1, groups = mta$niche, draw = "polygon", col=c("red", "green", "blue"))
+# Collect point locations and save as a new object
+sites.long1 <- sites.long(plot1, env.data = mta)
+# Collect ellipse data and save as a new object
+ellipses <- ordiellipse(plot1, groups = mta$niche, display = "sites", kind = "sd")
+ellipses.long1 <- ordiellipse.long(ellipses, grouping.name = "niche")
+```
+
+Basic ggplot option
+
+```{r}
+# Make CAPs Diagram in ggplot2. Here is a basic one:
+ggplot(data = sites.long1, aes(axis1, axis2, color = niche, shape = niche)) + 
+  geom_point() + geom_polygon(data = ellipses.long1, 
+                              aes(x = axis1, y = axis2, colour = niche, 
+                                  fill = after_scale(alpha(colour, 0.2))), 
+                              size = 0.2, show.legend = FALSE)
+```
+
+The nice thing about working in ggplot is you can customize all of the features. Here I've added gridlines at the 0 axis and changed the colors.
+
+# Box plot
+bp + scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9"))
+# Scatter plot
+sp + scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"))
+
+```{r}
+# CAPs ggplot with more features:
+cap <- ggplot(data = sites.long1, aes(axis1, axis2, color = niche, 
+                               shape = niche)) + 
+  geom_point() + 
+  geom_polygon(data = ellipses.long1, 
+               aes(x = axis1, y = axis2, color = niche, 
+                   fill = after_scale(alpha(color, 0.2))), 
+               size = 0.5, show.legend = FALSE) +
+  theme_classic() + # better theme
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5, size = 0.3) + # line at 0
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5, size = 0.3) + # line at 0
+  ggtitle("16S - CAPs of Niche Compartments") + # title
+  xlab("LD1") + ylab("LD2") #axis name based on CAPs format
+cap + scale_fill_manual(values=c("seagreen3", "sienna3", "honeydew4")) + scale_color_manual(values=c("seagreen3", "sienna3", "honeydew4"))
+```
+
+The first plot is the easiest (made in BiodiversityR). The second and third are made in ggplot2 by importing the point locations calculated in BiodiversityR. GGplot is easier to customize, so importing the points and ellipses is a good option.
+
+## Volcano Plots
+
+Volcano plots are more commonly used for metatranscriptomic or metagenomic data but can also be used to visualize treatment differences in amplicon data.
+
+If you don't already have DESeq2:
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("DESeq2")
+```
+
+Using DESeq to calculate the logfoldchange and p-values 
+
+```{r}
+# load packages
+library(DESeq2)
+# subset to roots
+root <- filter_data(input_rar, "niche", keep_vals = "root")
+# get tables
+tax <- root$taxonomy_loaded
+mta <- root$map_loaded
+tab <- root$data_loaded
+# transform otu table (might be necessary but try skipping)
+tab1 <- tab + 1
+# calculation
+voldat <- DESeqDataSetFromMatrix(countData = tab1, colData = mta, design= ~species)
+voldat2 <- DESeq(voldat, fitType = 'mean', minReplicatesForReplace = 7, parallel = FALSE)
+# results
+volres <- results(voldat2, contrast = c('species', 'corn', 'sugarbeet')) # first factor = up, second factor = down
+volres2 <- data.frame(volres, stringsAsFactors = FALSE, check.names = FALSE)
+volres3 <- volres2[order(volres2$padj, volres2$log2FoldChange, decreasing = c(FALSE, TRUE)), ]
+# create new column to label up and down based on the order of factors in #results
+volres3[which(volres3$log2FoldChange >= 1 & volres3$padj < 0.01),'sig'] <- 'up'
+volres3[which(volres3$log2FoldChange <= -1 & volres3$padj < 0.01),'sig'] <- 'down'
+volres3[which(abs(volres3$log2FoldChange) <= 1 | volres3$padj >= 0.01),'sig'] <- 'none'
+volres3$adjustp <-  -log10(volres3$padj)
+# add taxonomy information
+volrestax <- merge(volres3, tax, by = 'row.names')
+# take out the non-significant taxa if you want to (easier to read the plot)
+volrestax1 <- volrestax %>%
+  mutate(taxonomy1 = ifelse(sig == "none", "no_change", taxonomy1)) %>%
+  mutate(taxonomy2 = ifelse(sig == "none", "no_change", taxonomy2)) %>%
+  mutate(taxonomy3 = ifelse(sig == "none", "no_change", taxonomy3)) %>%
+  mutate(taxonomy4 = ifelse(sig == "none", "no_change", taxonomy4)) %>%
+  mutate(taxonomy5 = ifelse(sig == "none", "no_change", taxonomy5)) %>%
+  mutate(taxonomy6 = ifelse(sig == "none", "no_change", taxonomy6)) %>%
+  mutate(taxonomy7 = ifelse(sig == "none", "no_change", taxonomy7))
+# if you want to plot without labeling the non-significant taxa
+volrestax <- volrestax1
+```
+
+Make the volcano plot.
+
+Here's one with phylum level
+
+```{r}
+vol_plot <- volrestax %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = taxonomy2)) +
+  geom_point(size = 1.2) +
+  labs(x = 'log2(Fold Change)', y = '-log10(adjust p-value)') +  
+  theme(plot.title = element_text(hjust = 0.5, size = 14), panel.grid = element_blank(), 
+        panel.background = element_rect(color = 'black', fill = 'transparent'), 
+        legend.key = element_rect(fill = 'transparent'), legend.position = "bottom", 
+        legend.text = element_text(size = 5)) +
+  geom_vline(xintercept = c(-1, 1), lty = 3, color = 'black', linetype = "dashed") +  
+  geom_hline(yintercept = c(-2, 2), lty = 3, color = 'black', linetype = "dashed") +
+  xlim(-8, 8) + ylim(0, 33) + ggtitle ("Phylum - Corn vs. Sugarbeet")
+vol_plot
+```
+
+And here's one with class level
+
+```{r}
+vol_plot <- volrestax %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = taxonomy3)) +
+  geom_point(size = 1.2) +
+  labs(x = 'log2(Fold Change)', y = '-log10(adjust p-value)') +  
+  theme(plot.title = element_text(hjust = 0.5, size = 14), panel.grid = element_blank(), 
+        panel.background = element_rect(color = 'black', fill = 'transparent'), 
+        legend.key = element_rect(fill = 'transparent'), legend.position = "bottom", 
+        legend.text = element_text(size = 5), legend.key.size = unit(0.3, "lines")) +
+  geom_vline(xintercept = c(-1, 1), lty = 3, color = 'black', linetype = "dashed") +  
+  geom_hline(yintercept = c(-2, 2), lty = 3, color = 'black', linetype = "dashed") +
+  xlim(-8, 8) + ylim(0, 33) + ggtitle ("Phylum - Corn vs. Sugarbeet")
+vol_plot <- vol_plot + guides(shape = guide_legend(override.aes = list(size = 0.3)))
+vol_plot <- vol_plot + guides(color = guide_legend(override.aes = list(size = 0.3)))
+vol_plot
+```
+
+Here's one at the order level:
+
+```{r}
+vol_plot <- volrestax %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = taxonomy4)) +
+  geom_point(size = 1.2) +
+  labs(x = 'log2(Fold Change)', y = '-log10(adjust p-value)') +  
+  theme(plot.title = element_text(hjust = 0.5, size = 14), panel.grid = element_blank(), 
+        panel.background = element_rect(color = 'black', fill = 'transparent'), 
+        legend.key = element_rect(fill = 'transparent'), legend.position = "bottom", 
+        legend.text = element_text(size = 5), legend.key.size = unit(0.3, "lines")) +
+  geom_vline(xintercept = c(-1, 1), lty = 3, color = 'black', linetype = "dashed") +  
+  geom_hline(yintercept = c(-2, 2), lty = 3, color = 'black', linetype = "dashed") +
+  xlim(-8, 8) + ylim(0, 33) + ggtitle ("Phylum - Corn vs. Sugarbeet")
+vol_plot <- vol_plot + guides(shape = guide_legend(override.aes = list(size = 0.3)))
+vol_plot <- vol_plot + guides(color = guide_legend(override.aes = list(size = 0.3)))
+vol_plot
+```
+
+
+
+
